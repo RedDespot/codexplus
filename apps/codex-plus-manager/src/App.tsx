@@ -4,6 +4,7 @@ import {
   Activity,
   Bell,
   CheckCircle2,
+  Image,
   CircleArrowUp,
   Info,
   ExternalLink,
@@ -89,6 +90,10 @@ type RelayProfile = {
   name: string;
   baseUrl: string;
   apiKey: string;
+  imageGenerationEnabled: boolean;
+  imageGenerationUseSeparateApi: boolean;
+  imageGenerationBaseUrl: string;
+  imageGenerationApiKey: string;
 };
 
 type UserScriptInventory = {
@@ -200,6 +205,10 @@ const defaultSettings: BackendSettings = {
       name: "默认中转",
       baseUrl: "",
       apiKey: "",
+      imageGenerationEnabled: false,
+      imageGenerationUseSeparateApi: false,
+      imageGenerationBaseUrl: "",
+      imageGenerationApiKey: "",
     },
   ],
   activeRelayId: "default",
@@ -955,6 +964,18 @@ function RelayScreen({
       <Panel>
         <CardHead title="选择运行模式" detail={relay?.configPath ?? "官方登录、混合 API、纯 API 都在这里切换"} />
         <CardContent>
+          <GuideList
+            items={[
+              "先在 Codex/ChatGPT 中使用正常 ChatGPT 账号登录，软件只读取 auth.json 判断登录态。",
+              "在下方添加一个中转，填写 Base URL 和 Key，然后点选它作为当前中转。",
+              "点击“写入当前中转”，会把 Codex 配置切到 CodexPlusPlus provider，并启用 ChatGPT 登录态混合中转。",
+              "图片生成默认关闭；关闭时会经过本地代理裁剪 image_generation 工具，避免无图片权限中转返回 403。",
+              "点击“写入混合API（官方+API）”，会把 Codex 配置切到 CodexPlusPlus provider，并启用 ChatGPT 登录态混合中转。",
+              "点击“写入纯API模式”，会把 auth.json 改为 OPENAI_API_KEY，并使用当前中转 URL 和 Key。",
+              "如果需要回到官方登录态，点击“切回官方登录模式”后再打开 Codex++ 登录官方账号。",
+              "需要切换中转时，点选列表里的另一项并保存，再重新写入即可。",
+            ]}
+          />
           <div className="mode-grid three">
             <button className={`mode-option ${!relay?.configured ? "active" : ""}`} onClick={() => void actions.switchOfficialMode()} type="button">
               <strong>官方登录</strong>
@@ -981,6 +1002,21 @@ function RelayScreen({
             <Metric label="当前模式" value={apiModeLabel(relay)} />
             <Metric label="ChatGPT 登录" value={relay?.authenticated ? "已检测" : "未检测"} />
             <Metric label="登录账号" value={relay?.accountLabel ?? "-"} />
+            <Metric label="中转配置" value={relay?.configured ? "已写入" : "未写入"} />
+            <Metric label="当前中转" value={active.name || "-"} />
+            <Metric label="当前模式" value={normalized.launchMode === "relay" ? "中转注入" : "传统 patch"} />
+            <Metric
+              label="图片生成"
+              value={
+                active.imageGenerationEnabled
+                  ? active.imageGenerationUseSeparateApi
+                    ? "独立 API"
+                    : "当前中转"
+                  : "已禁用"
+              }
+            />
+            <Metric label="OpenAI 认证" value={relay?.requiresOpenaiAuth ? "已启用" : "未启用"} />
+            <Metric label="Bearer Token" value={relay?.hasBearerToken ? "已配置" : "未配置"} />
             <Metric label="当前 API" value={active.name || "-"} />
             <Metric label="历史会话" value={relay?.configured ? "CodexPlusPlus" : "openai"} />
             <Metric label="页面增强" value={normalized.launchMode === "relay" ? "兼容模式" : "完整模式"} />
@@ -1512,6 +1548,15 @@ function RelayProfileList({
               <strong>{profile.name || "未命名中转"}</strong>
               <span>{profile.baseUrl || "未填写 URL"}</span>
             </button>
+            <div className="relay-profile-actions">
+              <span className={`image-chip ${profile.imageGenerationEnabled ? "enabled" : ""}`}>
+                <Image className="h-3.5 w-3.5" />
+                {profile.imageGenerationEnabled
+                  ? profile.imageGenerationUseSeparateApi
+                    ? "图片独立 API"
+                    : "图片走当前中转"
+                  : "图片关闭"}
+              </span>
             <Button
               disabled={form.relayProfiles.length <= 1}
               onClick={() => onFormChange(removeRelayProfile(form, profile.id))}
@@ -1521,6 +1566,7 @@ function RelayProfileList({
             >
               <Trash2 className="h-4 w-4" />
             </Button>
+            </div>
           </div>
           <div className="relay-fields">
             <Field label="名称">
@@ -1544,6 +1590,80 @@ function RelayProfileList({
                 placeholder="输入中转服务的 API Key"
               />
             </Field>
+          </div>
+          <div className="image-relay-settings">
+            <label className="switch-row compact-switch">
+              <input
+                checked={profile.imageGenerationEnabled}
+                onChange={(event) =>
+                  onFormChange(
+                    updateRelayProfile(form, profile.id, {
+                      imageGenerationEnabled: event.currentTarget.checked,
+                      imageGenerationUseSeparateApi: event.currentTarget.checked
+                        ? profile.imageGenerationUseSeparateApi
+                        : false,
+                    }),
+                  )
+                }
+                type="checkbox"
+              />
+              <span>
+                <strong>允许当前中转使用图片生成</strong>
+                <small>关闭时会走本地代理裁剪 image_generation 工具，避免未开通图片权限的中转组返回 403。</small>
+              </span>
+            </label>
+            {profile.imageGenerationEnabled ? (
+              <>
+                <label className="switch-row compact-switch">
+                  <input
+                    checked={profile.imageGenerationUseSeparateApi}
+                    onChange={(event) =>
+                      onFormChange(
+                        updateRelayProfile(form, profile.id, {
+                          imageGenerationUseSeparateApi: event.currentTarget.checked,
+                        }),
+                      )
+                    }
+                    type="checkbox"
+                  />
+                  <span>
+                    <strong>图片生成使用独立 API 和 Key</strong>
+                    <small>包含图片生成工具的 Responses 请求会由 Codex++ 本地代理转发到下方图片 API。</small>
+                  </span>
+                </label>
+                {profile.imageGenerationUseSeparateApi ? (
+                  <div className="relay-fields image-fields">
+                    <Field label="图片 Base URL">
+                      <Input
+                        value={profile.imageGenerationBaseUrl}
+                        onChange={(event) =>
+                          onFormChange(
+                            updateRelayProfile(form, profile.id, {
+                              imageGenerationBaseUrl: event.currentTarget.value,
+                            }),
+                          )
+                        }
+                        placeholder="填写支持图片生成的 Base URL"
+                      />
+                    </Field>
+                    <Field label="图片 Key">
+                      <Input
+                        type="password"
+                        value={profile.imageGenerationApiKey}
+                        onChange={(event) =>
+                          onFormChange(
+                            updateRelayProfile(form, profile.id, {
+                              imageGenerationApiKey: event.currentTarget.value,
+                            }),
+                          )
+                        }
+                        placeholder="输入图片生成 API Key"
+                      />
+                    </Field>
+                  </div>
+                ) : null}
+              </>
+            ) : null}
           </div>
         </div>
       ))}
@@ -1830,12 +1950,17 @@ function normalizeSettings(settings: BackendSettings): BackendSettings {
             name: "默认中转",
             baseUrl: settings.relayBaseUrl || defaultSettings.relayBaseUrl,
             apiKey: settings.relayApiKey || "",
+            imageGenerationEnabled: false,
+            imageGenerationUseSeparateApi: false,
+            imageGenerationBaseUrl: "",
+            imageGenerationApiKey: "",
           },
         ];
+  const normalizedProfiles = profiles.map(normalizeRelayProfile);
   const activeRelayId = profiles.some((profile) => profile.id === settings.activeRelayId)
     ? settings.activeRelayId
     : profiles[0]?.id || "default";
-  return syncLegacyRelayFields({ ...defaultSettings, ...settings, relayProfiles: profiles, activeRelayId });
+  return syncLegacyRelayFields({ ...defaultSettings, ...settings, relayProfiles: normalizedProfiles, activeRelayId });
 }
 
 function activeRelayProfile(settings: BackendSettings): RelayProfile {
@@ -1844,6 +1969,17 @@ function activeRelayProfile(settings: BackendSettings): RelayProfile {
     settings.relayProfiles[0] ||
     defaultSettings.relayProfiles[0]
   );
+}
+
+function normalizeRelayProfile(profile: RelayProfile): RelayProfile {
+  return {
+    ...defaultSettings.relayProfiles[0],
+    ...profile,
+    imageGenerationEnabled: Boolean(profile.imageGenerationEnabled),
+    imageGenerationUseSeparateApi: Boolean(profile.imageGenerationUseSeparateApi),
+    imageGenerationBaseUrl: profile.imageGenerationBaseUrl || "",
+    imageGenerationApiKey: profile.imageGenerationApiKey || "",
+  };
 }
 
 function syncLegacyRelayFields(settings: BackendSettings): BackendSettings {
@@ -1870,6 +2006,10 @@ function addRelayProfile(settings: BackendSettings): BackendSettings {
     name: `中转 ${settings.relayProfiles.length + 1}`,
     baseUrl: defaultSettings.relayBaseUrl,
     apiKey: "",
+    imageGenerationEnabled: false,
+    imageGenerationUseSeparateApi: false,
+    imageGenerationBaseUrl: "",
+    imageGenerationApiKey: "",
   };
   return syncLegacyRelayFields({
     ...settings,
