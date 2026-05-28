@@ -94,6 +94,7 @@ type OverviewResult = CommandResult<{
 type BackendSettings = {
   codexAppPath: string;
   codexExtraArgs: string[];
+  windowsCodexLaunchMode: WindowsCodexLaunchMode;
   providerSyncEnabled: boolean;
   enhancementsEnabled: boolean;
   codexGoalsEnabled: boolean;
@@ -112,6 +113,7 @@ type BackendSettings = {
 };
 
 type LaunchMode = "patch" | "relay";
+type WindowsCodexLaunchMode = "packagedActivation" | "directProcess";
 
 type RelayProfile = {
   id: string;
@@ -374,6 +376,7 @@ const routes: Array<{ id: Route; label: string; icon: LucideIcon }> = [
 const defaultSettings: BackendSettings = {
   codexAppPath: "",
   codexExtraArgs: [],
+  windowsCodexLaunchMode: "packagedActivation",
   providerSyncEnabled: false,
   enhancementsEnabled: true,
   codexGoalsEnabled: false,
@@ -2061,6 +2064,22 @@ function SettingsScreen({
             />
           </Field>
           <p className="field-hint">每行一个参数，例如 --force_high_performance_gpu。不需要填写 open 或 --args。</p>
+          <label className="check-row">
+            <input
+              checked={form.windowsCodexLaunchMode === "directProcess"}
+              onChange={(event) =>
+                onFormChange({
+                  ...form,
+                  windowsCodexLaunchMode: event.currentTarget.checked ? "directProcess" : "packagedActivation",
+                })
+              }
+              type="checkbox"
+            />
+            <span>Windows 使用管理员直启官方 Codex</span>
+          </label>
+          <p className="field-hint">
+            开启后，WindowsApps 版 Codex 会跳过系统应用激活，先关闭旧 Codex 进程，再直接启动官方 Codex.exe。
+          </p>
           <Toolbar>
             <Button onClick={() => void actions.saveSettings()}>保存设置</Button>
           </Toolbar>
@@ -3826,6 +3845,7 @@ function normalizeSettings(settings: BackendSettings): BackendSettings {
   return syncLegacyRelayFields({
     ...defaultSettings,
     ...settings,
+    windowsCodexLaunchMode: normalizeWindowsCodexLaunchMode(settings.windowsCodexLaunchMode),
     relayCommonConfigContents,
     relayContextConfigContents,
     relayProfiles: profiles,
@@ -3839,6 +3859,10 @@ function codexExtraArgsToInput(args: string[] | undefined) {
 
 function inputToCodexExtraArgs(value: string) {
   return value === "" ? [] : value.split(/\r?\n/);
+}
+
+function normalizeWindowsCodexLaunchMode(value: string | undefined): WindowsCodexLaunchMode {
+  return value === "directProcess" ? "directProcess" : "packagedActivation";
 }
 
 function normalizeRelayProfile(profile: RelayProfile, defaultContextSelection = emptyContextSelection()): RelayProfile {
