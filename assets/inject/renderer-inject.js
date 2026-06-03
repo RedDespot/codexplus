@@ -63,6 +63,17 @@
   const codexThreadServiceTierMaxEntries = 120;
   const codexThreadServiceTierDraftBindWindowMs = 60 * 1000;
   const codexServiceTierRequestOverrideVersion = "2";
+  const codexThreadEndpointAuthRequestOverrideVersion = "1";
+  const codexThreadEndpointAuthStorageKey = "codexThreadEndpointAuthOverrides";
+  const codexThreadEndpointAuthCryptoVersion = "xor-v1";
+  const codexThreadEndpointAuthDraftVersion = "1";
+  const codexThreadEndpointAuthDraftStorageKey = "codexThreadEndpointAuthDraft";
+  const codexThreadEndpointAuthDraftBindWindowMs = 10 * 60 * 1000;
+  const codexThreadEndpointAuthSeedSalt = "codex++-per-thread-endpoint-auth";
+  const codexThreadEndpointAuthButtonAttr = "data-codex-thread-endpoint-auth-button";
+  const codexThreadEndpointAuthStyleId = "codex-thread-endpoint-auth-style";
+  const codexThreadEndpointAuthOverlayId = "codex-thread-endpoint-auth-overlay";
+  const codexThreadEndpointAuthPanelId = "codex-thread-endpoint-auth-panel";
   const codexAppServerModelRequestPatchVersion = "1";
   const codexThreadScrollMaxEntries = 120;
   const codexThreadScrollSaveThrottleMs = 120;
@@ -879,7 +890,7 @@
   }
 
   function defaultCodexPlusSettings() {
-    return { pluginEntryUnlock: true, forcePluginInstall: true, modelWhitelistUnlock: true, sessionDelete: true, markdownExport: true, projectMove: true, conversationTimeline: true, conversationView: false, conversationViewMaxWidth: conversationViewDefaultWidth, threadScrollRestore: true, zedRemoteOpen: true, upstreamWorktreeCreate: true, nativeMenuPlacement: true, serviceTierControls: false };
+    return { pluginEntryUnlock: true, forcePluginInstall: true, modelWhitelistUnlock: true, sessionDelete: true, markdownExport: true, projectMove: true, conversationTimeline: true, conversationView: false, conversationViewMaxWidth: conversationViewDefaultWidth, threadScrollRestore: true, zedRemoteOpen: true, upstreamWorktreeCreate: true, nativeMenuPlacement: true, serviceTierControls: false, threadEndpointAuth: false };
   }
 
   const codexPlusBackendSettingMap = {
@@ -896,6 +907,7 @@
     upstreamWorktreeCreate: "codexAppUpstreamWorktreeCreate",
     nativeMenuPlacement: "codexAppNativeMenuPlacement",
     serviceTierControls: "codexAppServiceTierControls",
+    threadEndpointAuth: "codexAppThreadEndpointAuth",
   };
 
   function backendCodexPlusSettings() {
@@ -926,6 +938,7 @@
         upstreamWorktreeCreate: false,
         nativeMenuPlacement: false,
         serviceTierControls: false,
+        threadEndpointAuth: false,
       };
     }
     try {
@@ -1037,6 +1050,14 @@
   const codexDefaultServiceTierSetting = { key: "default-service-tier", default: null };
   const codexServiceTierFallbackFastValue = "priority";
   const codexServiceTierModulePromises = new Map();
+  const codexThreadEndpointAuthState = {
+    map: null,
+    draft: null,
+    stats: null,
+    observer: null,
+    scanTimer: 0,
+    initialized: false,
+  };
   const codexThreadServiceTierModes = new Set(["inherit", "standard", "fast"]);
   const codexServiceTierControlModes = new Set(["inherit", "global-standard", "global-fast", "custom"]);
 
@@ -1559,6 +1580,645 @@
     return message;
   }
 
+  function codexThreadEndpointAuthNormalizeText(value) {
+    return String(value || "").trim();
+  }
+
+  function codexThreadEndpointAuthNormalizeBaseUrl(value) {
+    const text = codexThreadEndpointAuthNormalizeText(value).replace(/\/+$/, "");
+    if (!text) return "";
+    return /^https?:\/\//i.test(text) ? text : "";
+  }
+
+  function codexThreadEndpointAuthFNV1A32(text) {
+    let hash = 0x811c9dc5;
+    for (let index = 0; index < text.length; index += 1) {
+      hash ^= text.charCodeAt(index);
+      hash = (hash * 0x01000193) >>> 0;
+    }
+    return hash >>> 0;
+  }
+
+  function codexThreadEndpointAuthSeed(threadId) {
+    const host = window.location.host || "codex.local";
+    return codexThreadEndpointAuthFNV1A32(`${codexThreadEndpointAuthSeedSalt}|${host}|${threadId || ""}`) || 0x9e3779b9;
+  }
+
+  function codexThreadEndpointAuthXorBytes(inputBytes, threadId) {
+    const output = new Uint8Array(inputBytes.length);
+    let seed = codexThreadEndpointAuthSeed(threadId) >>> 0;
+    for (let index = 0; index < inputBytes.length; index += 1) {
+      seed ^= seed << 13;
+      seed ^= seed >>> 17;
+      seed ^= seed << 5;
+      output[index] = inputBytes[index] ^ (seed & 0xff);
+    }
+    return output;
+  }
+
+  function codexThreadEndpointAuthEncryptApiKey(apiKey, threadId) {
+    const plain = codexThreadEndpointAuthNormalizeText(apiKey);
+    if (!plain) return "";
+    const bytes = new TextEncoder().encode(plain);
+    const encrypted = codexThreadEndpointAuthXorBytes(bytes, threadId);
+    let binary = "";
+    encrypted.forEach((value) => {
+      binary += String.fromCharCode(value);
+    });
+    return btoa(binary);
+  }
+
+  function codexThreadEndpointAuthDecryptApiKey(apiKeyEnc, threadId) {
+    const text = codexThreadEndpointAuthNormalizeText(apiKeyEnc);
+    if (!text) return "";
+    try {
+      const binary = atob(text);
+      const bytes = new Uint8Array(binary.length);
+      for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
+      const plainBytes = codexThreadEndpointAuthXorBytes(bytes, threadId);
+      return codexThreadEndpointAuthNormalizeText(new TextDecoder().decode(plainBytes));
+    } catch (_) {
+      return "";
+    }
+  }
+
+  function codexThreadEndpointAuthNowIso() {
+    return new Date().toISOString();
+  }
+
+  function codexThreadEndpointAuthReadMap() {
+    try {
+      const parsed = JSON.parse(localStorage.getItem(codexThreadEndpointAuthStorageKey) || "{}");
+      const output = Object.create(null);
+      Object.entries(parsed || {}).forEach(([threadId, value]) => {
+        const safeThreadId = validThreadScrollSessionKey(threadId);
+        if (!safeThreadId || !value || typeof value !== "object") return;
+        const baseUrl = codexThreadEndpointAuthNormalizeBaseUrl(value.baseUrl || "");
+        const apiKeyPlain = codexThreadEndpointAuthNormalizeText(value.apiKey || "");
+        const apiKeyEnc = codexThreadEndpointAuthNormalizeText(value.apiKeyEnc || "");
+        const crypto = codexThreadEndpointAuthNormalizeText(value.crypto || "");
+        const apiKey = apiKeyPlain || (crypto === codexThreadEndpointAuthCryptoVersion ? codexThreadEndpointAuthDecryptApiKey(apiKeyEnc, safeThreadId) : "");
+        if (!baseUrl && !apiKey) return;
+        output[safeThreadId] = {
+          baseUrl,
+          apiKey,
+          updatedAt: codexThreadEndpointAuthNormalizeText(value.updatedAt) || codexThreadEndpointAuthNowIso(),
+        };
+      });
+      return output;
+    } catch (_) {
+      return Object.create(null);
+    }
+  }
+
+  function codexThreadEndpointAuthPersistMap(map) {
+    const persisted = Object.create(null);
+    Object.entries(map || {}).forEach(([threadId, value]) => {
+      const safeThreadId = validThreadScrollSessionKey(threadId);
+      if (!safeThreadId || !value || typeof value !== "object") return;
+      const baseUrl = codexThreadEndpointAuthNormalizeBaseUrl(value.baseUrl || "");
+      const apiKey = codexThreadEndpointAuthNormalizeText(value.apiKey || "");
+      if (!baseUrl && !apiKey) return;
+      persisted[safeThreadId] = {
+        baseUrl,
+        apiKeyEnc: codexThreadEndpointAuthEncryptApiKey(apiKey, safeThreadId),
+        crypto: codexThreadEndpointAuthCryptoVersion,
+        updatedAt: codexThreadEndpointAuthNormalizeText(value.updatedAt) || codexThreadEndpointAuthNowIso(),
+      };
+    });
+    localStorage.setItem(codexThreadEndpointAuthStorageKey, JSON.stringify(persisted));
+  }
+
+  function codexThreadEndpointAuthMap() {
+    if (!codexThreadEndpointAuthState.map) codexThreadEndpointAuthState.map = codexThreadEndpointAuthReadMap();
+    return codexThreadEndpointAuthState.map;
+  }
+
+  function codexThreadEndpointAuthSaveMap(nextMap) {
+    codexThreadEndpointAuthState.map = nextMap || Object.create(null);
+    codexThreadEndpointAuthPersistMap(codexThreadEndpointAuthState.map);
+  }
+
+  function codexThreadEndpointAuthNormalizeDraft(value) {
+    if (!value || typeof value !== "object") return null;
+    const baseUrl = codexThreadEndpointAuthNormalizeBaseUrl(value.baseUrl || "");
+    const apiKey = codexThreadEndpointAuthNormalizeText(value.apiKey || "");
+    if (!baseUrl && !apiKey) return null;
+    return {
+      baseUrl,
+      apiKey,
+      updatedAtMs: finiteNonNegativeNumber(value.updatedAtMs) || Date.now(),
+    };
+  }
+
+  function codexThreadEndpointAuthReadDraft() {
+    try {
+      const parsed = JSON.parse(localStorage.getItem(codexThreadEndpointAuthDraftStorageKey) || "null");
+      const rawDraft = parsed?.version === codexThreadEndpointAuthDraftVersion ? parsed?.draft : parsed;
+      return codexThreadEndpointAuthNormalizeDraft(rawDraft);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function codexThreadEndpointAuthPersistDraft(draft) {
+    const normalized = codexThreadEndpointAuthNormalizeDraft(draft);
+    if (!normalized) {
+      localStorage.removeItem(codexThreadEndpointAuthDraftStorageKey);
+      return;
+    }
+    try {
+      localStorage.setItem(codexThreadEndpointAuthDraftStorageKey, JSON.stringify({
+        version: codexThreadEndpointAuthDraftVersion,
+        draft: normalized,
+      }));
+    } catch (_) {}
+  }
+
+  function codexThreadEndpointAuthStats() {
+    if (codexThreadEndpointAuthState.stats) return codexThreadEndpointAuthState.stats;
+    codexThreadEndpointAuthState.stats = {
+      counts: { applied: 0, skipped: 0, errors: 0 },
+      byReason: Object.create(null),
+      byMethod: Object.create(null),
+      lastDecision: null,
+    };
+    return codexThreadEndpointAuthState.stats;
+  }
+
+  function codexThreadEndpointAuthResetStats() {
+    codexThreadEndpointAuthState.stats = {
+      counts: { applied: 0, skipped: 0, errors: 0 },
+      byReason: Object.create(null),
+      byMethod: Object.create(null),
+      lastDecision: null,
+    };
+    return codexThreadEndpointAuthState.stats;
+  }
+
+  function codexThreadEndpointAuthRecordDecision(decision) {
+    const stats = codexThreadEndpointAuthStats();
+    const reason = String(decision?.reason || "unknown");
+    const method = String(decision?.method || "");
+    if (decision?.applied) {
+      stats.counts.applied += 1;
+    } else if (reason === "error") {
+      stats.counts.errors += 1;
+    } else {
+      stats.counts.skipped += 1;
+    }
+    stats.byReason[reason] = (stats.byReason[reason] || 0) + 1;
+    if (method) stats.byMethod[method] = (stats.byMethod[method] || 0) + 1;
+    stats.lastDecision = {
+      applied: !!decision?.applied,
+      reason,
+      method,
+      messageType: String(decision?.messageType || ""),
+      threadId: String(decision?.threadId || ""),
+      usedDraft: !!decision?.usedDraft,
+      hasBaseUrl: !!decision?.hasBaseUrl,
+      hasApiKey: !!decision?.hasApiKey,
+      at: codexThreadEndpointAuthNowIso(),
+    };
+    return stats.lastDecision;
+  }
+
+  function codexThreadEndpointAuthDraftEntry() {
+    if (!codexThreadEndpointAuthState.draft) {
+      codexThreadEndpointAuthState.draft = codexThreadEndpointAuthReadDraft();
+    }
+    const draft = codexThreadEndpointAuthState.draft;
+    if (!draft || typeof draft !== "object") return null;
+    if (Date.now() - finiteNonNegativeNumber(draft.updatedAtMs) > codexThreadEndpointAuthDraftBindWindowMs) {
+      codexThreadEndpointAuthState.draft = null;
+      codexThreadEndpointAuthPersistDraft(null);
+      return null;
+    }
+    return codexThreadEndpointAuthNormalizeDraft(draft);
+  }
+
+  function codexThreadEndpointAuthSetDraft(entry) {
+    const normalized = codexThreadEndpointAuthNormalizeDraft(entry ? { ...entry, updatedAtMs: Date.now() } : null);
+    codexThreadEndpointAuthState.draft = normalized;
+    codexThreadEndpointAuthPersistDraft(normalized);
+  }
+
+  function codexThreadEndpointAuthBindDraftToThread(threadId) {
+    const safeThreadId = validThreadScrollSessionKey(threadId);
+    const draft = codexThreadEndpointAuthDraftEntry();
+    if (!safeThreadId || !draft) return false;
+    const map = { ...codexThreadEndpointAuthMap() };
+    if (!map[safeThreadId]) {
+      map[safeThreadId] = {
+        baseUrl: draft.baseUrl,
+        apiKey: draft.apiKey,
+        updatedAt: codexThreadEndpointAuthNowIso(),
+      };
+      codexThreadEndpointAuthSaveMap(map);
+    }
+    codexThreadEndpointAuthSetDraft(null);
+    return true;
+  }
+
+  function codexThreadEndpointAuthDrop(threadId) {
+    const safeThreadId = validThreadScrollSessionKey(threadId);
+    if (!safeThreadId) return false;
+    const map = { ...codexThreadEndpointAuthMap() };
+    if (!Object.prototype.hasOwnProperty.call(map, safeThreadId)) return false;
+    delete map[safeThreadId];
+    codexThreadEndpointAuthSaveMap(map);
+    return true;
+  }
+
+  function codexThreadEndpointAuthCurrentThreadId() {
+    const activeThreadId = validThreadScrollSessionKey(currentSessionRef().session_id)
+      || validThreadScrollSessionKey(locationThreadId())
+      || "";
+    if (activeThreadId) codexThreadEndpointAuthBindDraftToThread(activeThreadId);
+    return activeThreadId;
+  }
+
+  function codexThreadEndpointAuthRequestMethods() {
+    return new Set(["thread/start", "thread/resume", "turn/start"]);
+  }
+
+  function codexThreadEndpointAuthEntryForRequest(params = {}, threadIdHint = "") {
+    const method = String(params?.__codexThreadEndpointAuthMethod || "");
+    const threadId = method === "thread/start"
+      ? validThreadScrollSessionKey(params.threadId || threadIdHint)
+      : validThreadScrollSessionKey(params.threadId || params.conversationId || threadIdHint || codexThreadEndpointAuthCurrentThreadId());
+    if (!threadId) {
+      const draft = codexThreadEndpointAuthDraftEntry();
+      return draft ? { threadId: "", entry: draft, usedDraft: true } : null;
+    }
+    const map = codexThreadEndpointAuthMap();
+    const entry = map[threadId];
+    if (!entry || (!entry.baseUrl && !entry.apiKey)) return null;
+    return { threadId, entry, usedDraft: false };
+  }
+
+  function codexThreadEndpointAuthApply(method, params, threadIdHint = "") {
+    const safeMethod = String(method || "");
+    if (!codexThreadEndpointAuthRequestMethods().has(safeMethod)) return { params, meta: { applied: false, reason: "unsupported_method", method: safeMethod } };
+    if (!params || typeof params !== "object") return { params, meta: { applied: false, reason: "invalid_params", method: safeMethod } };
+    const lookupParams = { ...params, __codexThreadEndpointAuthMethod: safeMethod };
+    const found = codexThreadEndpointAuthEntryForRequest(lookupParams, threadIdHint);
+    if (!found) {
+      const methodThreadId = safeMethod === "thread/start"
+        ? validThreadScrollSessionKey(params.threadId || threadIdHint)
+        : validThreadScrollSessionKey(params.threadId || params.conversationId || threadIdHint || codexThreadEndpointAuthCurrentThreadId());
+      const hasDraft = !!codexThreadEndpointAuthDraftEntry();
+      return {
+        params,
+        meta: {
+          applied: false,
+          reason: methodThreadId ? "no_entry_for_thread" : (hasDraft ? "draft_expired" : "no_thread_or_draft"),
+          method: safeMethod,
+          threadId: methodThreadId || "",
+          usedDraft: false,
+        },
+      };
+    }
+    const { threadId, entry, usedDraft } = found;
+    const nextParams = { ...(params || {}) };
+    const tempProviderId = "codex_plus_thread_temp";
+    if (entry.baseUrl) nextParams.baseUrl = entry.baseUrl;
+    if (entry.apiKey) {
+      nextParams.apiKey = entry.apiKey;
+      nextParams.api_key = entry.apiKey;
+      nextParams.experimentalApiKey = entry.apiKey;
+      nextParams.experimental_bearer_token = entry.apiKey;
+      nextParams.bearerToken = entry.apiKey;
+      nextParams.authToken = entry.apiKey;
+    }
+    if (entry.baseUrl || entry.apiKey) {
+      const currentConfig = nextParams.config && typeof nextParams.config === "object" ? nextParams.config : {};
+      const currentNestedProviders = currentConfig.model_providers && typeof currentConfig.model_providers === "object"
+        ? currentConfig.model_providers
+        : {};
+      const currentFlatProvider = currentConfig[`model_providers.${tempProviderId}`];
+      const providerConfig = {
+        ...(currentNestedProviders[tempProviderId] && typeof currentNestedProviders[tempProviderId] === "object" ? currentNestedProviders[tempProviderId] : {}),
+        ...(currentFlatProvider && typeof currentFlatProvider === "object" ? currentFlatProvider : {}),
+        name: "Codex++ Thread Temp",
+        wire_api: "responses",
+      };
+      if (entry.baseUrl) providerConfig.base_url = entry.baseUrl;
+      if (entry.apiKey) providerConfig.experimental_bearer_token = entry.apiKey;
+      nextParams.modelProvider = tempProviderId;
+      nextParams.model_provider = tempProviderId;
+      nextParams.config = {
+        ...currentConfig,
+        model_provider: tempProviderId,
+        [`model_providers.${tempProviderId}`]: providerConfig,
+        model_providers: {
+          ...currentNestedProviders,
+          [tempProviderId]: providerConfig,
+        },
+      };
+    }
+    sendCodexPlusDiagnostic("thread_endpoint_auth_request_override_applied", {
+      method: safeMethod,
+      threadId,
+      hasBaseUrl: !!entry.baseUrl,
+      hasApiKey: !!entry.apiKey,
+      modelProvider: nextParams.modelProvider || nextParams.model_provider || "",
+    });
+    return {
+      params: nextParams,
+      meta: {
+        applied: true,
+        reason: "applied",
+        method: safeMethod,
+        threadId,
+        usedDraft,
+        hasBaseUrl: !!entry.baseUrl,
+        hasApiKey: !!entry.apiKey,
+      },
+    };
+  }
+
+  function codexThreadEndpointAuthRequestOverride(message) {
+    if (!codexPlusSettings().threadEndpointAuth) {
+      codexThreadEndpointAuthRecordDecision({ applied: false, reason: "feature_disabled", messageType: message?.type || "" });
+      return message;
+    }
+    if (!message || typeof message !== "object") {
+      codexThreadEndpointAuthRecordDecision({ applied: false, reason: "invalid_message", messageType: "" });
+      return message;
+    }
+    if (message.type === "send-cli-request-for-host") {
+      const method = String(message.method || "");
+      const result = codexThreadEndpointAuthApply(method, message.params);
+      codexThreadEndpointAuthRecordDecision({ ...result.meta, messageType: message.type });
+      return result.params === message.params ? message : { ...message, params: result.params };
+    }
+    if (message.type === "mcp-request" && message.request && typeof message.request === "object") {
+      const method = String(message.request.method || "");
+      const result = codexThreadEndpointAuthApply(method, message.request.params);
+      codexThreadEndpointAuthRecordDecision({ ...result.meta, messageType: message.type });
+      if (result.params === message.request.params) return message;
+      return { ...message, request: { ...message.request, params: result.params } };
+    }
+    if (message.type === "worker-request" && message.request && typeof message.request === "object") {
+      const method = String(message.request.method || "");
+      const result = codexThreadEndpointAuthApply(method, message.request.params);
+      codexThreadEndpointAuthRecordDecision({ ...result.meta, messageType: message.type });
+      if (result.params === message.request.params) return message;
+      return { ...message, request: { ...message.request, params: result.params } };
+    }
+    if (message.type === "thread-prewarm-start" && message.request && typeof message.request === "object") {
+      const result = codexThreadEndpointAuthApply("thread/start", message.request.params);
+      codexThreadEndpointAuthRecordDecision({ ...result.meta, messageType: message.type });
+      if (result.params === message.request.params) return message;
+      return { ...message, request: { ...message.request, params: result.params } };
+    }
+    if (message.type === "start-conversation") {
+      const result = codexThreadEndpointAuthApply("thread/start", message);
+      codexThreadEndpointAuthRecordDecision({ ...result.meta, messageType: message.type });
+      return result.params === message ? message : result.params;
+    }
+    if (message.type === "prewarm-thread-start-for-host" && message.params && typeof message.params === "object") {
+      const result = codexThreadEndpointAuthApply("thread/start", message.params);
+      codexThreadEndpointAuthRecordDecision({ ...result.meta, messageType: message.type });
+      return result.params === message.params ? message : { ...message, params: result.params };
+    }
+    if (message.type === "start-thread-for-host") {
+      const result = codexThreadEndpointAuthApply("thread/start", message);
+      codexThreadEndpointAuthRecordDecision({ ...result.meta, messageType: message.type });
+      return result.params === message ? message : result.params;
+    }
+    if (message.type === "start-turn-for-host" && message.params && typeof message.params === "object") {
+      const result = codexThreadEndpointAuthApply("turn/start", message.params, message.conversationId);
+      codexThreadEndpointAuthRecordDecision({ ...result.meta, messageType: message.type });
+      return result.params === message.params ? message : { ...message, params: result.params };
+    }
+    codexThreadEndpointAuthRecordDecision({ applied: false, reason: "unsupported_message_type", messageType: message.type || "" });
+    return message;
+  }
+
+  function installCodexThreadEndpointAuthDispatcherPatch() {
+    const patch = async () => {
+      try {
+        const module = await loadCodexAppModule("setting-storage-");
+        const dispatcherClass = typeof module.v === "function" && String(module.v).includes("dispatchMessage") ? module.v : null;
+        const dispatcher = dispatcherClass?.getInstance?.();
+        if (!dispatcher || typeof dispatcher.dispatchMessage !== "function") throw new Error("Codex dispatcher unavailable");
+        if (dispatcher.__codexThreadEndpointAuthOriginalDispatchMessage) {
+          window.__codexThreadEndpointAuthRequestOverrideInstalled = codexThreadEndpointAuthRequestOverrideVersion;
+          return;
+        }
+        dispatcher.__codexThreadEndpointAuthOriginalDispatchMessage = dispatcher.dispatchMessage.bind(dispatcher);
+        dispatcher.dispatchMessage = (type, payload) => {
+          const message = codexThreadEndpointAuthRequestOverride({ ...(payload || {}), type });
+          const nextType = message?.type || type;
+          const { type: _type, ...nextPayload } = message || {};
+          return dispatcher.__codexThreadEndpointAuthOriginalDispatchMessage(nextType, nextPayload);
+        };
+        window.__codexThreadEndpointAuthRequestOverrideInstalled = codexThreadEndpointAuthRequestOverrideVersion;
+        sendCodexPlusDiagnostic("thread_endpoint_auth_dispatcher_patch_installed", {});
+      } catch (error) {
+        codexThreadEndpointAuthRecordDecision({ applied: false, reason: "error", messageType: "dispatcher-patch" });
+        sendCodexPlusDiagnostic("thread_endpoint_auth_dispatcher_patch_failed", {
+          errorName: error?.name || "",
+          errorMessage: error?.message || String(error),
+        });
+      }
+    };
+    void patch();
+  }
+
+  function codexThreadEndpointAuthDeleteHook() {
+    const original = window.__codexSessionDeleteBridge;
+    if (typeof original !== "function" || original.__codexThreadEndpointAuthDeleteWrapped) return;
+    const wrapped = async (path, payload, ...rest) => {
+      if (String(path || "") === "/delete") {
+        const threadId = validThreadScrollSessionKey(
+          payload?.session_id
+          || payload?.sessionId
+          || payload?.thread_id
+          || payload?.threadId
+          || payload?.conversation_id
+          || payload?.conversationId
+          || "",
+        );
+        if (threadId) codexThreadEndpointAuthDrop(threadId);
+      }
+      return original(path, payload, ...rest);
+    };
+    wrapped.__codexThreadEndpointAuthDeleteWrapped = true;
+    window.__codexSessionDeleteBridge = wrapped;
+  }
+
+  function codexThreadEndpointAuthEnsureStyle() {
+    const existing = document.getElementById(codexThreadEndpointAuthStyleId);
+    if (existing?.dataset.version === "1") return;
+    existing?.remove();
+    const style = document.createElement("style");
+    style.id = codexThreadEndpointAuthStyleId;
+    style.dataset.version = "1";
+    style.textContent = `
+      [${codexThreadEndpointAuthButtonAttr}="1"] {
+        margin-left: 8px;
+        border: 1px solid rgba(148,163,184,.35);
+        border-radius: 8px;
+        background: rgba(15,23,42,.04);
+        color: inherit;
+        font: 12px/1.2 ui-sans-serif,system-ui;
+        padding: 4px 8px;
+        cursor: pointer;
+      }
+      #${codexThreadEndpointAuthOverlayId} {
+        position: fixed;
+        inset: 0;
+        z-index: 2147483200;
+        background: rgba(0,0,0,.35);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+      #${codexThreadEndpointAuthPanelId} {
+        width: min(520px, calc(100vw - 24px));
+        border: 1px solid rgba(148,163,184,.3);
+        border-radius: 12px;
+        background: #fff;
+        color: #111827;
+        padding: 14px;
+        font: 13px/1.4 ui-sans-serif,system-ui;
+      }
+      #${codexThreadEndpointAuthPanelId} h3 { margin: 0 0 10px; font-size: 15px; }
+      #${codexThreadEndpointAuthPanelId} .row { margin: 8px 0; }
+      #${codexThreadEndpointAuthPanelId} label { display: block; margin-bottom: 4px; color: #4b5563; }
+      #${codexThreadEndpointAuthPanelId} input {
+        width: 100%; box-sizing: border-box; border: 1px solid #d1d5db;
+        border-radius: 8px; padding: 8px 10px; font: 13px ui-sans-serif,system-ui;
+      }
+      #${codexThreadEndpointAuthPanelId} .actions { margin-top: 12px; display: flex; justify-content: flex-end; gap: 8px; }
+      #${codexThreadEndpointAuthPanelId} button {
+        border: 1px solid #d1d5db; border-radius: 8px; background: #fff;
+        padding: 7px 10px; cursor: pointer;
+      }
+      #${codexThreadEndpointAuthPanelId} button.primary { border-color: #2563eb; background: #2563eb; color: #fff; }
+      #${codexThreadEndpointAuthPanelId} .hint { margin-top: 8px; color: #6b7280; font-size: 12px; }
+      #${codexThreadEndpointAuthPanelId} .danger { color: #b91c1c; }
+    `;
+    document.documentElement.appendChild(style);
+  }
+
+  function codexThreadEndpointAuthRemovePanel() {
+    document.getElementById(codexThreadEndpointAuthOverlayId)?.remove();
+  }
+
+  function codexThreadEndpointAuthShowPanel() {
+    codexThreadEndpointAuthRemovePanel();
+    const threadId = codexThreadEndpointAuthCurrentThreadId();
+    const draft = codexThreadEndpointAuthDraftEntry();
+    const existing = threadId
+      ? (codexThreadEndpointAuthMap()[threadId] || { baseUrl: "", apiKey: "" })
+      : (draft || { baseUrl: "", apiKey: "" });
+    const hasSavedApiKey = !!codexThreadEndpointAuthNormalizeText(existing.apiKey);
+    const isDraftTarget = !threadId;
+    const overlay = document.createElement("div");
+    overlay.id = codexThreadEndpointAuthOverlayId;
+    overlay.innerHTML = `
+      <div id="${codexThreadEndpointAuthPanelId}" role="dialog" aria-modal="true">
+        <h3>对话临时API</h3>
+        <div class="row"><strong>${isDraftTarget ? "目标" : "Thread ID"}:</strong> <code>${escapeHtml(isDraftTarget ? "新对话草稿" : threadId)}</code></div>
+        <div class="row">
+          <label>baseUrl (http/https)</label>
+          <input id="${codexThreadEndpointAuthPanelId}-base" placeholder="https://api.example.com" value="${escapeHtml(existing.baseUrl || "")}" />
+        </div>
+        <div class="row">
+          <label>apiKey (Bearer token)</label>
+          <input id="${codexThreadEndpointAuthPanelId}-key" type="password" autocomplete="off" placeholder="${hasSavedApiKey ? "Saved (leave empty to keep)" : "sk-..."}" value="" />
+        </div>
+        <div class="actions">
+          <button id="${codexThreadEndpointAuthPanelId}-delete">删除此对话配置</button>
+          <button id="${codexThreadEndpointAuthPanelId}-cancel">取消</button>
+          <button id="${codexThreadEndpointAuthPanelId}-save" class="primary">保存</button>
+        </div>
+      </div>
+    `;
+    overlay.addEventListener("click", (event) => {
+      if (event.target === overlay) codexThreadEndpointAuthRemovePanel();
+    });
+    document.body.appendChild(overlay);
+    const baseInput = document.getElementById(`${codexThreadEndpointAuthPanelId}-base`);
+    const keyInput = document.getElementById(`${codexThreadEndpointAuthPanelId}-key`);
+    document.getElementById(`${codexThreadEndpointAuthPanelId}-cancel`)?.addEventListener("click", codexThreadEndpointAuthRemovePanel);
+    document.getElementById(`${codexThreadEndpointAuthPanelId}-delete`)?.addEventListener("click", () => {
+      if (threadId) {
+        codexThreadEndpointAuthDrop(threadId);
+      } else {
+        codexThreadEndpointAuthSetDraft(null);
+      }
+      codexThreadEndpointAuthRemovePanel();
+    });
+    document.getElementById(`${codexThreadEndpointAuthPanelId}-save`)?.addEventListener("click", () => {
+      const baseUrl = codexThreadEndpointAuthNormalizeBaseUrl(baseInput?.value || "");
+      const enteredApiKey = codexThreadEndpointAuthNormalizeText(keyInput?.value || "");
+      const apiKey = enteredApiKey || (hasSavedApiKey ? existing.apiKey : "");
+      if (!baseUrl && !apiKey) {
+        showToast("baseUrl 和 apiKey 至少填写一项", null);
+        return;
+      }
+      if ((baseInput?.value || "").trim() && !baseUrl) {
+        showToast("baseUrl 必须是 http/https URL", null);
+        return;
+      }
+      if (threadId) {
+        const map = { ...codexThreadEndpointAuthMap() };
+        map[threadId] = { baseUrl, apiKey, updatedAt: codexThreadEndpointAuthNowIso() };
+        codexThreadEndpointAuthSaveMap(map);
+      } else {
+        codexThreadEndpointAuthSetDraft({ baseUrl, apiKey });
+      }
+      codexThreadEndpointAuthRemovePanel();
+      showToast(threadId ? "对话临时API配置已保存" : "新对话草稿API配置已保存", null);
+    });
+  }
+
+  function installCodexThreadEndpointAuthButton() {
+    codexThreadEndpointAuthEnsureStyle();
+    const mount = document.querySelector(selectors.appHeader) || document.querySelector("header");
+    if (!mount || mount.querySelector(`[${codexThreadEndpointAuthButtonAttr}="1"]`)) return;
+    const button = document.createElement("button");
+    button.type = "button";
+    button.setAttribute(codexThreadEndpointAuthButtonAttr, "1");
+    button.textContent = "对话临时API";
+    button.title = "为当前对话设置 baseUrl / apiKey";
+    button.addEventListener("click", codexThreadEndpointAuthShowPanel);
+    mount.appendChild(button);
+  }
+
+  function installCodexThreadEndpointAuthRuntime() {
+    if (codexThreadEndpointAuthState.initialized) return;
+    codexThreadEndpointAuthState.initialized = true;
+    codexThreadEndpointAuthMap();
+    codexThreadEndpointAuthPersistMap(codexThreadEndpointAuthMap());
+    codexThreadEndpointAuthState.draft = codexThreadEndpointAuthReadDraft();
+    codexThreadEndpointAuthResetStats();
+    installCodexThreadEndpointAuthDispatcherPatch();
+    window.__codexThreadEndpointAuth = {
+      version: codexThreadEndpointAuthRequestOverrideVersion,
+      getMap: () => ({ ...codexThreadEndpointAuthMap() }),
+      getDraft: () => codexThreadEndpointAuthDraftEntry(),
+      getStats: () => {
+        const stats = codexThreadEndpointAuthStats();
+        return {
+          installed: window.__codexThreadEndpointAuthRequestOverrideInstalled === codexThreadEndpointAuthRequestOverrideVersion,
+          draftPersisted: !!codexThreadEndpointAuthDraftEntry(),
+          counts: { ...stats.counts },
+          byReason: { ...stats.byReason },
+          byMethod: { ...stats.byMethod },
+          lastDecision: stats.lastDecision ? { ...stats.lastDecision } : null,
+        };
+      },
+      resetStats: () => codexThreadEndpointAuthResetStats(),
+      dropThreadConfig: (threadId) => codexThreadEndpointAuthDrop(threadId),
+    };
+  }
+
   function installCodexServiceTierDispatcherPatch() {
     if (window.__codexServiceTierRequestOverrideInstalled === codexServiceTierRequestOverrideVersion) return;
     const patch = async () => {
@@ -1589,6 +2249,14 @@
     };
     void patch();
   }
+
+  window.removeEventListener("codex-thread-endpoint-auth-delete-hook", window.__codexThreadEndpointAuthDeleteHookHandler, true);
+  window.__codexThreadEndpointAuthDeleteHookHandler = () => {
+    try {
+      codexThreadEndpointAuthDeleteHook();
+    } catch (_) {}
+  };
+  window.addEventListener("codex-thread-endpoint-auth-delete-hook", window.__codexThreadEndpointAuthDeleteHookHandler, true);
 
   async function loadBackendSettings() {
     try {
@@ -1921,6 +2589,10 @@
             <div class="codex-plus-row">
               <div><div class="codex-plus-row-title">Fast 按钮</div><div class="codex-plus-row-description">显示服务模式切换按钮，并允许把请求切到 Fast / priority；默认关闭以避免误触高价服务模式。</div></div>
               <button type="button" class="codex-plus-toggle" data-codex-plus-setting="serviceTierControls"><span></span></button>
+            </div>
+            <div class="codex-plus-row">
+              <div><div class="codex-plus-row-title">对话临时API</div><div class="codex-plus-row-description">在会话页头显示“对话临时API”按钮，可按对话临时设置 baseUrl/apiKey 覆盖。</div></div>
+              <button type="button" class="codex-plus-toggle" data-codex-plus-setting="threadEndpointAuth"><span></span></button>
             </div>
             <div class="codex-plus-row" data-codex-service-tier-controls="true">
               <div><div class="codex-plus-row-title">服务模式</div><div class="codex-plus-row-description">继承使用 config.toml 的 service tier；全局模式覆盖全部 thread；自定义允许按 thread 覆盖。</div></div>
@@ -6901,6 +7573,15 @@
   function scanLightweight() {
     installStyle();
     installCodexServiceTierDispatcherPatch();
+    installCodexThreadEndpointAuthRuntime();
+    installCodexThreadEndpointAuthDispatcherPatch();
+    codexThreadEndpointAuthDeleteHook();
+    if (codexPlusSettings().threadEndpointAuth) {
+      installCodexThreadEndpointAuthButton();
+    } else {
+      document.querySelector(`[${codexThreadEndpointAuthButtonAttr}="1"]`)?.remove();
+      codexThreadEndpointAuthRemovePanel();
+    }
     installCodexPlusMenu();
     scheduleBackendHeartbeat();
     installDeleteButtonEventDelegation();
