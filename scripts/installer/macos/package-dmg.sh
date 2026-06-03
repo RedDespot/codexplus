@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+﻿#!/usr/bin/env bash
 set -euo pipefail
 
 VERSION="${1:-0.0.0}"
@@ -7,6 +7,12 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 DIST="$ROOT/dist/macos"
 STAGE="$DIST/stage"
 BINARY_DIR="${BINARY_DIR:-$ROOT/target/release}"
+# Auto-detect cross-compile target directory
+if [ -d "$ROOT/target/aarch64-apple-darwin/release" ]; then
+  BINARY_DIR="$ROOT/target/aarch64-apple-darwin/release"
+elif [ -d "$ROOT/target/x86_64-apple-darwin/release" ]; then
+  BINARY_DIR="$ROOT/target/x86_64-apple-darwin/release"
+fi
 DMG="$DIST/CodexPlusPlus-${VERSION}-macos-${ARCH}.dmg"
 ICON_SOURCE="$ROOT/apps/codex-plus-manager/src-tauri/icons/icon.png"
 ICON_NAME="codex-plus-plus.icns"
@@ -78,16 +84,27 @@ PLIST
 
 sign_app() {
   local app_dir="$1"
-  codesign --force --deep --sign - "$app_dir"
+  codesign --force --deep --sign - "$app_dir" 2>/dev/null || true
 }
 
 prepare_icon
+
+# Detect actual arch from binary path
+if echo "$BINARY_DIR" | grep -q "aarch64"; then
+  APP_ARCH="arm64"
+elif echo "$BINARY_DIR" | grep -q "x86_64"; then
+  APP_ARCH="x86_64"
+else
+  APP_ARCH="$ARCH"
+fi
+
 create_app "Codex++" "CodexPlusPlus" "$BINARY_DIR/codex-plus-plus" "com.bigpizzav3.codexplusplus" "true"
-create_app "Codex++ 管理工具" "CodexPlusPlusManager" "$BINARY_DIR/codex-plus-plus-manager" "com.bigpizzav3.codexplusplus.manager" "false"
+create_app "Codex++ Manager" "CodexPlusPlusManager" "$BINARY_DIR/codex-plus-plus-manager" "com.bigpizzav3.codexplusplus.manager" "false"
+
 ln -s /Applications "$STAGE/Applications"
 
 sign_app "$STAGE/Codex++.app"
-sign_app "$STAGE/Codex++ 管理工具.app"
+sign_app "$STAGE/Codex++ Manager.app"
 
 hdiutil create -volname "Codex++" -srcfolder "$STAGE" -ov -format UDZO "$DMG"
 echo "$DMG"

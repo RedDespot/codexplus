@@ -1,0 +1,91 @@
+﻿name: Build macOS
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-macos:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            arch: Apple Silicon (M1/M2/M3/M4)
+          - target: x86_64-apple-darwin
+            arch: Intel Mac
+
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install frontend dependencies
+        working-directory: apps/codex-plus-manager
+        run: npm install --package-lock=false
+
+      - name: Build frontend
+        working-directory: apps/codex-plus-manager
+        run: npm run vite:build
+        env:
+          NODE_OPTIONS: --max-old-space-size=4096
+
+      - name: Build binaries
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package as .app bundles
+        env:
+          VERSION: "1.1.8"
+        run: bash scripts/installer/macos/package-dmg.sh "$VERSION" "${{ matrix.arch }}"
+
+      - name: Create output directory
+        run: mkdir -p dist/macos
+
+      - name: Move .app bundles to dist
+        run: |
+          mv dist/macos-unpacked/*.app dist/macos/ 2>/dev/null || true
+          mv dist/macos/*.app dist/macos/ 2>/dev/null || true
+
+      - name: List artifacts
+        run: find dist/macos -type f \( -name "*.app" -o -name "*.dmg" \) | head -10
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.arch }}-binaries
+          path: dist/macos/
+          retention-days: 7
+
+  create-release:
+    needs: build-macos
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: List downloaded artifacts
+        run: find artifacts -type f | head -20
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: macos-build
+          name: macOS Build
+          draft: true
+          files: |
+            artifacts/**/*
